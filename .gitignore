@@ -1,0 +1,6 @@
+/misc/debug-output.txt
+/misc/elf.cfg
+/*.pyc
+.idea
+/misc
+elf.cfg

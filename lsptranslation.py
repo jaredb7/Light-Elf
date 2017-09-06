@@ -71,6 +71,7 @@ class xNetwork:
         self.file= file
         self.maxChan= 0
         self.networks= []
+        self.mapChans=False
         self.ProcessNetworks()
 
     def ProcessNetworks(self):
@@ -81,18 +82,93 @@ class xNetwork:
         i = 0
         for net in root.findall('network'):
             networks.append({})
+            startchan = 0
+            endchan = 0
+            nettype = ""
             for key in net.keys():
+                if key == "NetworkType":
+                    nettype = net.get(key)
+                    if nettype == "E131":
+                        nettype = nettype + "/Uni." + net.get("BaudRate")
                 if key == "LastChannel":
                     self.mapChans = True
+                if key == "MaxChannels":
+                    if i == 0:
+                        startchan = 1
+                        endchan = net.get(key)
+                    else:
+                        startchan = int(networks[i-1]['EndChan']) + 1
+                        endchan = int(startchan) + int(net.get(key)) - 1  # inclusive so -1
+
                 networks[i][key] = net.get(key)
-            i+=1
+            networks[i]['StartChan'] = startchan
+            networks[i]['EndChan'] = endchan
+
+            print ("Network #" + str(i) + " ["+nettype+"]: start: " + str(networks[i]['StartChan']) +
+                   " >> end: " + str(networks[i]['EndChan']))
+
+            i += 1
             self.maxChan = self.maxChan + int(net.get('MaxChannels'))
 
+    def getNetworkType(self, net):
+        nettype = self.networks[net]['NetworkType']
+        return nettype
+
+    def getFriendlyNetworkType(self, net):
+        nettype = self.getNetworkType(net)
+
+        if nettype == "E131":
+            nettype = nettype + "/Uni." + self.networks[net]['BaudRate']
+
+        return nettype
+
+    def getFriendlyName(self, net):
+        nettype = self.getNetworkType(net)
+        friendly_name = "Network #" + net + " ["+nettype+"]"
+        return friendly_name
+
+    def isValidNetwork(self, net):
+        # Check if supplied network exist in xLights networks
+        # TODO remove crude remap
+        # if int(net) > 70:
+        #     net = int(net)-70
+        #     print "net Network" + str(net)
+
+        try:
+            n = self.networks[int(net)-1]
+            print ("Valid xLight Network ["+str(net)+"]")
+            return True
+        except IndexError:
+            print ("WARNING!! LSP Network ["+str(net)+"], not available in xLights Network.")
+            # exit() ##TODO remove
+            return False
+
     def getNetStartChan(self, net):
+        # TODO remove
+        # if net >= 70:
+        #     net -= 70
+        #     print "net Network" + str(net)
+
         chan = 0
         for i in range(net-1):
             chan += int(self.networks[i]['MaxChannels'])
-        return chan
+        return self.getStartChan(int(net))
+
+    def getStartChan(self, net):
+        if self.isValidNetwork(net):
+            return self.networks[net-1]['StartChan']
+        else:
+            return self.getMaxChannels()
+
+    def getEndChan(self, net):
+        if self.isValidNetwork(int(net)):
+            # TODO remove
+            # if int(net) >= 70:
+            #     net -= 70
+
+            return self.networks[int(net-1)]['EndChan']
+        else:
+            return self.getMaxChannels()
 
     def getNetCount(self):
         return self.networks.count()
@@ -145,24 +221,43 @@ class Sequence():
     directory for the unzipped LSP sequence
     """
 
-    def __init__(self, seqdir,netInf, tempDir="C:\\xlights\\temp", execDir = None):
+    def __init__(self, seqdir, seqname, netInf, tempDir="C:\\xlights\\temp", execDir = None):
 
         self.chanEffectCounts = {}
         self.effectCount = 0
         self.chanDict = {}
+        self.seqname = seqname
         self.seqdir = seqdir
-        self.networks= netInf
+        self.networks = netInf
         self.tempDir = tempDir
         self.execDir = execDir
         self.logLevel = 3
+        self.remapList = []
+        self.remapRequired = False
         #gc.enable()
 
 #-------------------------------------------------------------------------------
     def procSequence(self):
-        #start with a root directory. assume that we have a Sequnce file and a dir
+        # start with a root directory. assume that we have a Sequnce file and a dir
         os.chdir(self.seqdir)
-        sTree = ElementTree.parse('Sequence')
+
+        # does the 'sequence' file exist?
+        # if it doesn't, the imported sequence may not be a v2.5 sequence
+        # in this case the sequence is named the same as the imported .msq, adjust sequence name
+        # then extract controllers
+        if os.path.isfile('Sequence'):
+            sTree = ElementTree.parse('Sequence')
+        else:
+            self.log("Cannot find file 'Sequence', Imported sequence may not be a LSP 2.5 sequence")
+            self.log("Attempting < LSP 2.5 Import")
+            sTree = ElementTree.parse(self.seqname)
+            self.extractControllers(sTree)
+
         self.getMediaInfo(sTree)
+
+        #Remapping required?
+        # TODO stop processing
+
         del sTree
 
         self.log("Channels in Networks: %d"%self.networks.maxChan)
@@ -175,7 +270,77 @@ class Sequence():
     def log(self, string):
         string += "\n"
         self.logFile.write(string)
-##        print string
+        print string
+
+    def isRemappingRequired(self):
+        return self.remapRequired
+
+#-------------------------------------------------------------------------------
+    def zoneCheck(self, zone, name, zid, ztype, zprotocol):
+
+        remapListLength = len(self.remapList) #not 0 based, after .append this is a valid index
+
+        self.remapList.append({})
+        self.remapList[remapListLength]['id'] = zid
+        self.remapList[remapListLength]['name'] = name
+        self.remapList[remapListLength]['zone'] = zone
+        self.remapList[remapListLength]['type'] = ztype
+        self.remapList[remapListLength]['proto'] = zprotocol
+
+        if self.networks.isValidNetwork(zone):
+            # Target the same xLight network
+            self.remapList[remapListLength]['xln_target'] = zone
+            return True
+        else:
+            # No xLight network exists to match controller zone
+            # TODO sequence requires remapping
+            self.remapRequired = True
+            self.remapList[remapListLength]['xln_target'] = -1
+            return False
+
+#-------------------------------------------------------------------------------
+    def extractControllers(self, tree):
+        """Extract embedded XML data for controllers on older LSP 2.0 sequences into
+        seperate xml files to mimic LSP 2.5 structures"""
+
+        os.chdir(self.seqdir)
+
+        self.log("Extracting Controller Data from sequence..")
+
+        # extract controllers from <2.5 sequence
+        root = tree.getroot()
+        controllers = root.find('ControllerList')
+
+        # make controllers directory is it doesn't exist
+        controller_path = self.seqdir + '\\' + 'Controllers'
+
+        if not os.path.isdir(controller_path):
+            self.log("Cannot find Controllers folder, creating...")
+            os.makedirs(controller_path)
+
+        # extract all controllers and write seperate xml files for each
+        for controller in controllers.findall('Controller'):
+            conName = controller.find('ControllerName').text
+            conZone = controller.find('ControllerZone').text
+
+            conID = int(controller.find('ControllerID').text)
+            conType = int(controller.find('ControllerType').text)
+            conProtocol = int(controller.find('ControllerProtocol').text)
+
+            self.log("Extracting Controller Data for controller, " + conName + " (Zone: " + conZone + " )")
+
+            fo = open(controller_path+'\\'+conName+'.xml', 'w')
+            fo.write(ElementTree.tostring(controller, "utf-8", "xml"))
+            fo.close()
+
+            # is zone in the range of xLights networks??
+            # TODO if not we will have to remap
+            self.zoneCheck(conZone, conName, conID, conType, conProtocol)
+
+
+        self.log("Done extracting Controller Data for " + self.seqname)
+        del controllers
+        del tree
 
 #-------------------------------------------------------------------------------
     def extractSequence(self):
@@ -242,6 +407,7 @@ class Sequence():
             self.songFile = mmf.find('MediaFileName').text
         else:
             self.songFile = "blank"
+
 #-------------------------------------------------------------------------------
     def isValidChans(self, rchan, gchan, bchan, conZone, conID):
         """validate that the channels in current processing time are valid
@@ -250,11 +416,13 @@ class Sequence():
         #at the moment just validate that the channel number is less than the
         #max channel (no overruns)
 
-        return (self.networks.getMaxChannels >= \
-                    max(rchan,gchan,bchan))
+        return (max(rchan, gchan, bchan) <=
+                self.networks.getEndChan(conZone))
 
-#TODO -- Need a function to calculate the actual channel based on network
-# definition etc in the network file. spare me having to pass around zone and id
+        #TODO pass zone, calculate start and end channel, are the rgb chans in this range?
+
+        #TODO -- Need a function to calculate the actual channel based on network
+        # definition etc in the network file. spare me having to pass around zone and id
 
 #-------------------------------------------------------------------------------
     def calcLORChan(self, netNum, chan, conID):
@@ -397,8 +565,7 @@ class Sequence():
 ##            else:
 ##                self.chanEffectCounts[chan] = 1
             self.effectCount += 1
-            self.procEffect(chan, effect, startPer, perDiff, \
-                            startIntensity, endIntensity)
+            self.procEffect(chan, effect, startPer, perDiff, startIntensity, endIntensity)
 
 
 #-------------------------------------------------------------------------------
@@ -417,8 +584,7 @@ class Sequence():
 ##                      string = ''
 
 #-------------------------------------------------------------------------------
-    def procEffect(self, chan, effect, startPer, perDiff, \
-                   startIntensity, endIntensity):
+    def procEffect(self, chan, effect, startPer, perDiff, startIntensity, endIntensity):
         """Handle single color effects generation"""
         temp = perDiff if perDiff != 0 else 1
         rampDiff = endIntensity - startIntensity
@@ -499,7 +665,7 @@ class Sequence():
             colorStart = getColorVals(-1)
             try:
                 if effect == 2 or effect == 1:
-                    print "foo"
+                    print "effect 1 or 2"
                     colorStart = getColorVals(int(timeIntervals[idx].get('bst')),
                                                                           inpct)
                     colorEnd   = getColorVals(int(timeIntervals[idx].get('ben')),
@@ -577,6 +743,8 @@ class Sequence():
         self.outputxLightsFileHDR(FH, self.numPeriods, self.songFile)
         FH.write(self.data)
         FH.close()
+        print("Done generating xseq: " + outfile)
+
 #-------------------------------------------------------------------------------
     def outputFalconHDR(self, FH, nPer):
         chanCount = self.networks.getMaxChannels()
